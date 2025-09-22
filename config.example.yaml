@@ -24,11 +24,36 @@ thresholds:
 feeds:
   tdnet: https://www.release.tdnet.info/rss/TDnet.xml
   prtimes: https://prtimes.jp/index.rdf
+  valuepress: https://www.value-press.com/rss/index.rdf
+  kyodo_pr: https://kyodonewsprwire.jp/feed/release
+  dreamnews: https://www.dreamnews.jp/?action_rss=1
+  newscast: https://newscast.jp/rss
+  thebridge: https://thebridge.jp/feed
+  itmedia_business: https://rss.itmedia.co.jp/rss/2.0/business.xml
+  nhk_business: https://www3.nhk.or.jp/rss/news/cat5.xml
+  nhk_economy: https://www3.nhk.or.jp/rss/news/cat6.xml
   # 企業IR RSS例を追加可能
+
+collectors:
+  # 追加データソース例: RSSプラグイン形式（feedsと同様の仕組みを別名で拡張可能）
+  # - name: example_ir
+  #   type: rss
+  #   url: https://example.com/ir/feed.xml
+  # 外部API対応コレクタは `type` に "モジュール:関数" または `kabu2.collectors` エントリポイント名を指定します。
+  # - name: premium_source
+  #   type: yourpkg.collectors.premium:collect
+  #   token: YOUR_API_TOKEN
 
 feeds_priority:
   tdnet: 1.5
-  prtimes: 0
+  prtimes: 0.5
+  kyodo_pr: 0.3
+  valuepress: 0.2
+  dreamnews: 0.2
+  newscast: 0.2
+  itmedia_business: -0.3
+  nhk_business: -0.5
+  nhk_economy: -0.5
 
 feeds_ai:
   max_keys: 3
