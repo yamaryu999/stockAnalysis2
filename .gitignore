@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*.log
+.venv/
+artifacts/
+*.pyc
+*.pyo
+*.pyd
+*.swp
+.DS_Store
+.cache/

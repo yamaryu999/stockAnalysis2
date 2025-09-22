@@ -1,0 +1,49 @@
+# 設定テンプレート（コピーして config.yaml として使用）
+
+weights:
+  upgrade: 4
+  buyback_large: 5
+  buyback_small: 3
+  dividend_increase: 2
+  split: 2
+  big_order: 3
+  partner: 2
+  partner_tier1: 2
+  approval_patent: 4
+  kpi_surprise_low: 2
+  kpi_surprise_high: 4
+  negative_offering: -4
+  lawsuit: -3
+  deficit_widen: -2
+  intraday_bonus: 1
+
+thresholds:
+  min_score: 4
+  top_k: 10
+
+feeds:
+  tdnet: https://www.release.tdnet.info/rss/TDnet.xml
+  prtimes: https://prtimes.jp/index.rdf
+  # 企業IR RSS例を追加可能
+
+feeds_priority:
+  tdnet: 1.5
+  prtimes: 0
+
+feeds_ai:
+  max_keys: 3
+  fresh_hours: 12
+  stale_penalty: 5.0
+  repeat_penalty: 2.0
+  history_weight: 0.5
+  cooldown_hours: 4
+
+storage:
+  path: data/news.jsonl
+
+notifier:
+  slack:
+    enabled: false
+    webhook_env: SLACK_WEBHOOK_URL
+    min_score: 6
+    cooldown_min: 30

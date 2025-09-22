@@ -1,0 +1,8 @@
+feedparser>=6.0.10
+requests>=2.31.0
+httpx>=0.27.0
+rapidfuzz>=3.6.1
+PyYAML>=6.0.1
+python-dateutil>=2.9.0
+streamlit>=1.38.0
+pandas>=2.2.0
