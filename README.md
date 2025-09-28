@@ -34,6 +34,20 @@ streamlit run kabu2/ui/app.py
 ```
 python -m kabu2 collect --config config.yaml --out data/news.jsonl --feeds tdnet prtimes
 ```
+- `config.collectors` に追加した名前付きソースも `--feeds example_ir` のように選択できます。`type` が `rss` の場合は個別URLをfeedsと同様に扱えます。
+
+### カスタムコレクタを追加する
+`config.yaml` の `collectors` セクションに以下のようなエントリを追加すると、RSS以外の外部APIや有料フィードを統合できます。
+
+```yaml
+collectors:
+  - name: premium_ir
+    type: yourpkg.collectors.premium:collect
+    token: YOUR_API_TOKEN
+    universe: jp_smallcap
+```
+
+`type` には `モジュール:関数` 形式か `kabu2.collectors` エントリポイント名を指定します。関数は辞書設定を受け取り `NewsItem` のリストまたはイテレータを返せばOKです（非同期 `async def` もサポート）。
 
 ## ランキングと通知（CLI）
 ```
@@ -48,7 +62,14 @@ python -m kabu2 dedupe --config config.yaml
 
 # 発表日時で並び替え、必要なら最新N件だけを残す
 python -m kabu2 compact --config config.yaml --keep 2000
+
+# 過去ニュースと株価でタグ重みを検証（平均リターン/回帰で提案値を出力）
+python -m kabu2 backtest --config config.yaml --input data/news.jsonl --horizon 3 --output backtest_report.json
 ```
+
+`backtest` サブコマンドは JSONL のヒット履歴と株価データ（Yahoo Finance）を突き合わせ、
+タグごとの平均リターンや勝率を算出した上で回帰分析による重み候補を提示します。
+`--write-config` オプションを指定すると、提案されたブレンド重みを YAML として書き出せます。
 
 ## ディレクトリ構成
 - `kabu2/` … パッケージ本体（collector/extractor/scorer/notifier ほか）
@@ -69,6 +90,10 @@ python -m kabu2 compact --config config.yaml --keep 2000
   - `min_score`: この値未満は非表示、`top_k`: 上位から表示する件数
 - feeds（収集対象）
   - 任意のキー名 → RSS/AtomのURL。UIやCLIでキーを指定して収集可能
+- collectors（プラグインコレクタ）
+  - `type` で指定したコレクタ関数に設定を渡して追加データソースを呼び出します。`rss` を選べば単独RSSや有料フィードを個別キーとして扱えます。
+  - `type` には `モジュール:関数` 形式か、`kabu2.collectors` エントリポイント名を指定できます（例: `yourpkg.collectors.premium:collect`）。
+  - `name` を付けると CLI の `--feeds` や UI 側の表示で識別しやすくなります。
 - feeds_priority（AIブースト）
   - フィードごとのブースト値。正で優先、負で抑制します（AIで選定の際に加点）。
 - feeds_ai（AIチューニング）

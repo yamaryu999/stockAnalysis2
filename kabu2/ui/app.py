@@ -6,8 +6,9 @@ import os
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Mapping, Tuple, Optional
 from collections import Counter
+from html import escape
 
 import pandas as pd
 import streamlit as st
@@ -20,7 +21,7 @@ import sys
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from kabu2.collector.rss import collect_many, parse_feed
+from kabu2.collector import collect_from_config, parse_feed
 from kabu2.config import load_config, save_config
 from kabu2.extractor.rules import extract, load_name_map
 from kabu2.models import NewsItem, ScoredItem
@@ -41,10 +42,38 @@ def load_jsonl(path: str) -> List[NewsItem]:
     return items
 
 
-@st.cache_data(show_spinner=False)
-def cached_collect(feed_items: Tuple[Tuple[str, str], ...]) -> List[NewsItem]:
-    feed_map = {k: v for k, v in feed_items if k and v}
-    return collect_many(feed_map)
+def collect_selected(cfg: Dict[str, Any], selected: List[str]) -> List[NewsItem]:
+    if not selected:
+        return []
+
+    feeds_cfg = cfg.get("feeds", {}) or {}
+    collectors_cfg = cfg.get("collectors", []) or []
+
+    selected_set = {key for key in selected if key}
+    feed_subset = {key: feeds_cfg[key] for key in selected_set if key in feeds_cfg and feeds_cfg[key]}
+
+    collector_subset: List[Dict[str, Any]] = []
+    for spec in collectors_cfg:
+        if not isinstance(spec, Mapping):
+            continue
+        name = spec.get("name")
+        if not name:
+            continue
+        name_str = str(name)
+        if name_str not in selected_set:
+            continue
+        collector_subset.append(deepcopy(dict(spec)))
+
+    if not feed_subset and not collector_subset:
+        return []
+
+    sub_cfg: Dict[str, Any] = {}
+    if feed_subset:
+        sub_cfg["feeds"] = feed_subset
+    if collector_subset:
+        sub_cfg["collectors"] = collector_subset
+
+    return collect_from_config(sub_cfg)
 
 
 def normalize_config(cfg: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -54,6 +83,7 @@ def normalize_config(cfg: Dict[str, Any] | None) -> Dict[str, Any]:
     thresholds.setdefault("min_score", 0)
     thresholds.setdefault("top_k", 10)
     base.setdefault("feeds", {})
+    base.setdefault("collectors", [])
     base.setdefault("feeds_priority", {})
     feeds_ai = base.setdefault("feeds_ai", {})
     feeds_ai.setdefault("max_keys", 3)
@@ -541,9 +571,22 @@ def ai_pick_feeds(cfg: Dict[str, Any], name_map_path: str, *, per_feed_limit: in
 
 def render_card(item: ScoredItem, variant: str = "default") -> None:
     n = item.news
-    tags = ", ".join(item.reasons) if item.reasons else "-"
-    published = n.published_at.strftime("%Y-%m-%d %H:%M") if isinstance(n.published_at, datetime) else "-"
+    published_raw = n.published_at.strftime("%Y-%m-%d %H:%M") if isinstance(n.published_at, datetime) else "-"
     hold_label = "スイング" if item.hold == "swing" else "デイ"
+    score_display = escape(str(item.score))
+    source_label = escape(n.source or "-")
+    published_label = escape(published_raw)
+    hold_chip = escape(hold_label)
+    ticker_label = escape(n.ticker or "-")
+    company_label = escape(n.company_name or "-")
+    reasons = item.reasons or []
+    tags_html = "".join(f"<span class=\"tag-chip\">{escape(reason)}</span>" for reason in reasons)
+    if not tags_html:
+        tags_html = "<span class=\"tag-chip tag-chip-empty\">シグナル待ち</span>"
+    if n.link:
+        title_html = f"<a href=\"{escape(n.link)}\" target=\"_blank\" rel=\"noopener noreferrer\">{escape(n.title or '-')}</a>"
+    else:
+        title_html = escape(n.title or "-")
 
     card_class = "card"
     if variant != "default":
@@ -552,17 +595,76 @@ def render_card(item: ScoredItem, variant: str = "default") -> None:
     st.markdown(
         f"""
         <div class="{card_class}">
-            <div class="badge">{item.score}</div>
+            <div class="badge">{score_display}</div>
             <div class="card-body">
-                <div class="card-meta">{published} · {n.source}</div>
-                <div class="card-title"><a href="{n.link}" target="_blank">{n.title}</a></div>
-                <div class="card-sub">{n.ticker or '-'} · {n.company_name or '-'} · {hold_label}</div>
-                <div class="card-tags">{tags}</div>
+                <div class="card-meta">
+                    <span class="meta-slot">{published_label}</span>
+                    <span class="meta-dot"></span>
+                    <span class="meta-slot">{source_label}</span>
+                    <span class="meta-chip">{hold_chip}</span>
+                </div>
+                <div class="card-title">{title_html}</div>
+                <div class="card-sub">
+                    <span class="sub-group">
+                        <span class="sub-label">コード</span>
+                        <span class="sub-code">{ticker_label}</span>
+                    </span>
+                    <span class="sub-divider"></span>
+                    <span class="sub-group">
+                        <span class="sub-label">企業</span>
+                        <span class="sub-company">{company_label}</span>
+                    </span>
+                </div>
+                <div class="card-tags">{tags_html}</div>
             </div>
         </div>
         """,
         unsafe_allow_html=True,
+        )
+
+
+def render_hero(cfg: Dict[str, Any], items: List[NewsItem], data_mode: str, min_score: int, top_k: int) -> None:
+    feeds = cfg.get("feeds", {}) or {}
+    weights = cfg.get("weights", {}) or {}
+    feed_count = len(feeds)
+    active_weights = sum(1 for value in weights.values() if int(value or 0) != 0)
+    item_count = len(items)
+    mode_label = "ライブ収集モード" if data_mode == "collect" else "ファイル解析モード"
+    pills = [mode_label, f"スコア閾値 {min_score:+}", f"Top {top_k} 件"]
+    pills_html = "".join(f"<span class=\"hero-pill\">{escape(text)}</span>" for text in pills)
+
+    stat_defs = [
+        ("登録フィード", str(feed_count), "Feeds"),
+        ("アクティブルール", str(active_weights), "Weights"),
+        ("読み込みニュース", str(item_count), "Items"),
+    ]
+    stats_html = "".join(
+        f"""
+        <div class=\"hero-stat\">
+            <span class=\"hero-stat-value\">{escape(value)}</span>
+            <span class=\"hero-stat-label\">{escape(label)}</span>
+            <span class=\"hero-stat-hint\">{escape(hint)}</span>
+        </div>
+        """
+        for label, value, hint in stat_defs
     )
+
+    timestamp = _jst_now().strftime("%Y/%m/%d %H:%M")
+    hero_html = f"""
+    <div class=\"hero\">
+        <div class=\"hero-inner\">
+            <div class=\"hero-main\">
+                <div class=\"hero-badge\">Signal Intelligence</div>
+                <h1>kabu2 シグナルボード</h1>
+                <p class=\"hero-lead\">最新ニュースから日本株のチャンスを素早く捕捉</p>
+                <div class=\"hero-pills\">{pills_html}</div>
+                <div class=\"hero-timestamp\">更新 {escape(timestamp)} JST</div>
+            </div>
+            <div class=\"hero-stats\">{stats_html}</div>
+        </div>
+    </div>
+    """
+    st.markdown(hero_html, unsafe_allow_html=True)
 
 
 def main() -> None:
@@ -571,114 +673,415 @@ def main() -> None:
     st.markdown(
         """
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Noto+Sans+JP:wght@400;500;700&display=swap');
         :root {
-            color-scheme: dark light;
+            color-scheme: dark;
+            --accent: #38bdf8;
+            --accent-strong: #0ea5e9;
+            --bg-base: #060914;
+            --bg-soft: rgba(15, 23, 42, 0.74);
+            --border-soft: rgba(148, 163, 184, 0.22);
         }
         body, .stApp {
-            background: linear-gradient(135deg, #0f172a, #1e293b);
+            font-family: 'Inter', 'Noto Sans JP', sans-serif;
+            background:
+                radial-gradient(circle at 0% 0%, rgba(56, 189, 248, 0.18), transparent 55%),
+                radial-gradient(circle at 90% 12%, rgba(129, 140, 248, 0.2), transparent 60%),
+                linear-gradient(135deg, #0f172a, #020617 78%);
             color: #e2e8f0;
         }
-        .stMetric, .stSelectbox label, .stNumberInput label, .stFileUploader label {
-            color: #cbd5f5 !important;
+        .stApp header, [data-testid="stHeader"] {
+            background: transparent;
+        }
+        .block-container {
+            max-width: 1200px;
+            padding-top: 2.8rem;
+            padding-bottom: 4rem;
+        }
+        .stMetric-label, .stMetric-value {
+            color: rgba(226, 232, 240, 0.9) !important;
+        }
+        [data-testid="stSidebar"] {
+            background: rgba(6, 10, 21, 0.78);
+            border-right: 1px solid rgba(148, 163, 184, 0.18);
+            backdrop-filter: blur(18px);
+        }
+        [data-testid="stSidebar"] .block-container {
+            padding-top: 2.2rem;
+        }
+        ::-webkit-scrollbar {
+            width: 9px;
+            height: 9px;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: rgba(56, 189, 248, 0.35);
+            border-radius: 999px;
+        }
+        ::-webkit-scrollbar-track {
+            background: rgba(15, 23, 42, 0.45);
+        }
+        .hero {
+            position: relative;
+            margin-bottom: 2.4rem;
+            padding: 1.9rem 2.4rem;
+            border-radius: 26px;
+            background: linear-gradient(135deg, rgba(14, 165, 233, 0.32), rgba(79, 70, 229, 0.32));
+            border: 1px solid rgba(148, 163, 184, 0.25);
+            box-shadow: 0 45px 70px rgba(8, 47, 73, 0.35);
+            overflow: hidden;
+        }
+        .hero::after {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle at 18% 20%, rgba(255, 255, 255, 0.12), transparent 55%);
+            opacity: 0.6;
+            pointer-events: none;
+        }
+        .hero-inner {
+            position: relative;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 2.4rem;
+            justify-content: space-between;
+            align-items: flex-end;
+            z-index: 1;
+        }
+        .hero-main {
+            flex: 1 1 320px;
+            display: flex;
+            flex-direction: column;
+            gap: 0.9rem;
+        }
+        .hero-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.25rem 0.7rem;
+            border-radius: 999px;
+            background: rgba(15, 23, 42, 0.55);
+            color: #f8fafc;
+            font-size: 0.78rem;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+        }
+        .hero-main h1 {
+            margin: 0;
+            font-size: 1.95rem;
+            font-weight: 700;
+            color: #f8fafc;
+        }
+        .hero-lead {
+            margin: 0;
+            max-width: 36rem;
+            color: rgba(226, 232, 240, 0.85);
+            font-size: 1.02rem;
+            line-height: 1.6;
+        }
+        .hero-pills {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.6rem;
+        }
+        .hero-pill {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.35rem 0.9rem;
+            border-radius: 999px;
+            background: rgba(15, 23, 42, 0.55);
+            border: 1px solid rgba(56, 189, 248, 0.3);
+            color: #e0f2fe;
+            font-size: 0.82rem;
+            letter-spacing: 0.04em;
+        }
+        .hero-timestamp {
+            font-size: 0.8rem;
+            color: rgba(226, 232, 240, 0.65);
+            letter-spacing: 0.08em;
+        }
+        .hero-stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 0.9rem;
+            min-width: 260px;
+        }
+        .hero-stat {
+            padding: 1.1rem 1.25rem;
+            border-radius: 18px;
+            background: rgba(15, 23, 42, 0.58);
+            border: 1px solid rgba(148, 163, 184, 0.22);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+            display: flex;
+            flex-direction: column;
+            gap: 0.3rem;
+        }
+        .hero-stat-value {
+            font-size: 1.65rem;
+            font-weight: 600;
+            color: #f8fafc;
+        }
+        .hero-stat-label {
+            font-size: 0.85rem;
+            color: rgba(226, 232, 240, 0.75);
+        }
+        .hero-stat-hint {
+            font-size: 0.72rem;
+            text-transform: uppercase;
+            letter-spacing: 0.14em;
+            color: rgba(148, 163, 184, 0.7);
         }
         .card {
             position: relative;
-            padding: 1.2rem 1.5rem 1.1rem 1.5rem;
-            border-radius: 16px;
-            background: rgba(15, 23, 42, 0.72);
-            box-shadow: 0 24px 35px rgba(15, 23, 42, 0.45);
-            border: 1px solid rgba(148, 163, 184, 0.1);
-            margin-bottom: 1.1rem;
+            padding: 1.4rem 1.6rem 1.2rem 1.6rem;
+            border-radius: 20px;
+            background: rgba(12, 17, 30, 0.82);
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            box-shadow: 0 24px 45px rgba(8, 47, 73, 0.35);
+            transition: transform 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+            overflow: hidden;
+        }
+        .card::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: linear-gradient(120deg, rgba(14, 165, 233, 0.08), rgba(99, 102, 241, 0.05));
+            opacity: 0;
+            transition: opacity 180ms ease;
         }
         .card:hover {
-            transform: translateY(-2px);
-            transition: transform 180ms ease;
-            box-shadow: 0 32px 45px rgba(14, 116, 144, 0.25);
+            transform: translateY(-3px);
+            border-color: rgba(56, 189, 248, 0.35);
+            box-shadow: 0 30px 60px rgba(14, 116, 144, 0.28);
+        }
+        .card:hover::before {
+            opacity: 1;
         }
         .card.card-quick {
-            background: linear-gradient(135deg, #f8fafc, #e0f2fe);
+            background: linear-gradient(135deg, rgba(248, 250, 252, 0.96), rgba(224, 242, 254, 0.95));
             color: #0f172a;
             border: 1px solid rgba(14, 165, 233, 0.35);
-            box-shadow: 0 18px 28px rgba(14, 165, 233, 0.18);
-        }
-        .card.card-quick .badge {
-            background: linear-gradient(135deg, #0ea5e9, #6366f1);
-            color: #f8fafc;
-        }
-        .card.card-quick .card-meta {
-            color: rgba(30, 41, 59, 0.75);
+            box-shadow: 0 24px 50px rgba(14, 165, 233, 0.18);
         }
         .card.card-quick .card-title a {
             color: #0f172a;
         }
-        .card.card-quick .card-sub {
-            color: #1d4ed8;
+        .card.card-quick .card-meta {
+            color: rgba(15, 23, 42, 0.65);
         }
-        .card.card-quick .card-tags {
+        .card.card-quick .card-sub {
+            color: rgba(15, 23, 42, 0.82);
+        }
+        .card.card-quick .sub-label {
+            background: rgba(14, 165, 233, 0.18);
+            border-color: rgba(14, 165, 233, 0.32);
             color: #0f172a;
-            opacity: 0.75;
+        }
+        .card.card-quick .sub-code {
+            color: #0b1120;
+        }
+        .card.card-quick .sub-divider {
+            background: rgba(15, 23, 42, 0.35);
+        }
+        .card.card-quick .tag-chip {
+            background: rgba(14, 165, 233, 0.14);
+            border-color: rgba(14, 165, 233, 0.26);
+            color: #0f172a;
+        }
+        .card.card-quick .badge {
+            background: linear-gradient(135deg, #0ea5e9, #6366f1);
+            color: #f8fafc;
+            box-shadow: 0 12px 24px rgba(14, 165, 233, 0.3);
         }
         .badge {
             position: absolute;
             top: -14px;
-            left: 16px;
+            left: 20px;
             background: linear-gradient(135deg, #22d3ee, #3b82f6);
-            border-radius: 12px;
-            padding: 0.3rem 0.75rem;
+            border-radius: 999px;
+            padding: 0.35rem 0.78rem;
             font-weight: 700;
-            color: #0f172a;
-            box-shadow: 0 12px 22px rgba(34, 211, 238, 0.35);
+            color: #0b1120;
+            box-shadow: 0 16px 32px rgba(34, 211, 238, 0.32);
+            z-index: 2;
         }
         .card-body {
             display: flex;
             flex-direction: column;
-            gap: 0.35rem;
+            gap: 0.55rem;
+            position: relative;
+            z-index: 1;
         }
         .card-meta {
-            font-size: 0.85rem;
-            opacity: 0.75;
-            letter-spacing: 0.02em;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 0.45rem;
+            font-size: 0.82rem;
+            color: rgba(226, 232, 240, 0.7);
+        }
+        .meta-slot {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+        }
+        .meta-dot {
+            display: inline-block;
+            width: 4px;
+            height: 4px;
+            border-radius: 999px;
+            background: rgba(148, 163, 184, 0.6);
+        }
+        .meta-chip {
+            margin-left: auto;
+            padding: 0.22rem 0.65rem;
+            border-radius: 999px;
+            background: rgba(56, 189, 248, 0.16);
+            border: 1px solid rgba(56, 189, 248, 0.25);
+            color: #e0f2fe;
+            font-size: 0.76rem;
+            letter-spacing: 0.06em;
         }
         .card-title {
-            font-size: 1.05rem;
+            font-size: 1.1rem;
             font-weight: 600;
-            line-height: 1.35;
+            line-height: 1.4;
+            color: #f8fafc;
         }
         .card-title a {
-            color: #f8fafc;
+            color: inherit;
             text-decoration: none;
         }
         .card-title a:hover {
             text-decoration: underline;
         }
         .card-sub {
+            display: flex;
+            align-items: center;
+            gap: 0.65rem;
             font-size: 0.9rem;
-            color: #a5b4fc;
-            letter-spacing: 0.02em;
+            color: rgba(199, 210, 254, 0.95);
+            letter-spacing: 0.01em;
+        }
+        .sub-group {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+        }
+        .sub-label {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.1rem 0.45rem;
+            border-radius: 6px;
+            background: rgba(56, 189, 248, 0.14);
+            border: 1px solid rgba(56, 189, 248, 0.28);
+            color: #bae6fd;
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+        }
+        .sub-code {
+            font-weight: 700;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            letter-spacing: 0.03em;
+        }
+        .sub-divider {
+            display: inline-block;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: rgba(148, 163, 184, 0.5);
+        }
+        .sub-company {
+            opacity: 0.9;
         }
         .card-tags {
-            font-size: 0.85rem;
-            color: #bae6fd;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.4rem;
         }
-        .metric-box {
-            border-radius: 16px;
-            background: rgba(15, 23, 42, 0.68);
-            padding: 1.1rem 1.4rem;
-            border: 1px solid rgba(148, 163, 184, 0.18);
+        .tag-chip {
+            display: inline-flex;
+            align-items: center;
+            padding: 0.25rem 0.6rem;
+            border-radius: 999px;
+            background: rgba(14, 165, 233, 0.14);
+            border: 1px solid rgba(14, 165, 233, 0.18);
+            color: #bae6fd;
+            font-size: 0.78rem;
+            letter-spacing: 0.01em;
+        }
+        .tag-chip-empty {
+            background: rgba(148, 163, 184, 0.15);
+            border-color: rgba(148, 163, 184, 0.25);
+            color: rgba(226, 232, 240, 0.65);
+        }
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 0.4rem;
         }
         .stTabs [data-baseweb="tab"] {
-            color: rgba(226, 232, 240, 0.8);
+            border-radius: 999px;
+            background: transparent;
+            color: rgba(226, 232, 240, 0.75);
             font-weight: 600;
+            padding: 0.45rem 1.1rem;
         }
         .stTabs [aria-selected="true"] {
-            color: #22d3ee !important;
+            background: rgba(14, 165, 233, 0.18) !important;
+            color: #38bdf8 !important;
+        }
+        .st-expander {
+            border-radius: 14px !important;
+            border: 1px solid rgba(148, 163, 184, 0.18) !important;
+            background: rgba(15, 23, 42, 0.55) !important;
+        }
+        .st-expander:hover {
+            border-color: rgba(56, 189, 248, 0.3) !important;
+        }
+        .stButton button {
+            border-radius: 12px;
+            background: linear-gradient(135deg, rgba(14, 165, 233, 0.7), rgba(59, 130, 246, 0.7));
+            border: 1px solid rgba(56, 189, 248, 0.4);
+            color: #f8fafc;
+            font-weight: 600;
+            padding: 0.45rem 1.2rem;
+            transition: transform 140ms ease, box-shadow 140ms ease;
+        }
+        .stButton button:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 12px 20px rgba(14, 165, 233, 0.25);
+        }
+        .stButton button:focus {
+            outline: none;
+            box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.35);
+        }
+        .stButton button:active {
+            transform: translateY(0);
+        }
+        .stCheckbox label, .stRadio label, .stSelectbox label, .stNumberInput label, .stFileUploader label {
+            color: rgba(226, 232, 240, 0.85) !important;
+            font-weight: 500;
+        }
+        .stTextInput input, .stNumberInput input, .stTextArea textarea, .stSelectbox [role="combobox"], .stMultiSelect [data-baseweb="select"] > div {
+            border-radius: 12px !important;
+            background: rgba(15, 23, 42, 0.65) !important;
+            border: 1px solid rgba(71, 85, 105, 0.6) !important;
+            color: #e2e8f0 !important;
+        }
+        .stSlider > div[data-baseweb="slider"] > div {
+            color: rgba(226, 232, 240, 0.85);
+        }
+        .stSlider [data-baseweb="slider"] > div > div {
+            background: rgba(36, 211, 255, 0.25);
+        }
+        .stSlider [data-baseweb="slider"] .MuiSlider-thumb, .stSlider [data-baseweb="slider"] div[role="slider"] {
+            background: linear-gradient(135deg, #22d3ee, #3b82f6);
+            box-shadow: 0 0 0 4px rgba(56, 189, 248, 0.25);
         }
         .notice {
-            margin: 0.6rem 0 0.9rem;
-            padding: 0.95rem 1.15rem;
-            border-radius: 14px;
+            margin: 0.75rem 0 1.1rem;
+            padding: 1rem 1.25rem;
+            border-radius: 16px;
             font-size: 0.95rem;
-            line-height: 1.55;
+            line-height: 1.6;
             border: 1px solid rgba(148, 163, 184, 0.35);
             box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
             backdrop-filter: blur(6px);
@@ -721,8 +1124,7 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
-    st.title("kabu2 シグナルボード")
-    st.caption("最新ニュースから日本株のチャンスを素早く捕捉")
+    # ヒーローセクションでタイトルを表示するため、既存のタイトル表示は置き換え
 
     cfg_path = st.sidebar.text_input(
         "設定ファイルのパス",
@@ -775,12 +1177,12 @@ def main() -> None:
 
     mode_labels = {
         "ファイルアップロード": "file",
-        "RSSを今すぐ取得": "collect",
+        "フィード/コレクタを今すぐ取得": "collect",
     }
     mode_choice = st.sidebar.radio(
         "データソースを選択",
         options=list(mode_labels.keys()),
-        help="シグナル計算に使うデータの入手方法を選びます（ファイルアップロード／RSS即時取得）。",
+        help="シグナル計算に使うデータの入手方法を選びます（ファイルアップロード／フィード・コレクタ即時取得）。",
     )
     data_mode = mode_labels[mode_choice]
 
@@ -803,19 +1205,44 @@ def main() -> None:
         else:
             items = st.session_state.get("uploaded_items", [])
     else:
-        feeds = cfg.get("feeds", {})
-        options = list(feeds.keys())
+        feeds_cfg = cfg.get("feeds", {}) or {}
+        collectors_cfg = cfg.get("collectors", []) or []
+        source_types: Dict[str, str] = {}
+        options: List[str] = []
+        for key in feeds_cfg.keys():
+            options.append(key)
+            source_types[key] = "feed"
+        for spec in collectors_cfg:
+            if not isinstance(spec, Mapping):
+                continue
+            name = spec.get("name")
+            if not name:
+                continue
+            name_str = str(name)
+            if name_str not in options:
+                options.append(name_str)
+            source_types[name_str] = "collector"
+
         # Allow AI to propose feed selection for this mode as well
         ai_pick = st.sidebar.checkbox(
-            "AIで取得フィードを自動選択", value=True, help="各フィードの最新ニュースを解析し、上位のフィードを提案します。"
+            "AIで取得ソースを自動選択", value=True, help="各フィードの最新ニュースを解析し、上位ソースを提案します（RSS優先）。"
         )
-        # Maintain selected in session state so AI proposal can overwrite defaults
-        default_selected = st.session_state.get("collect_selected", options[:2])
+        session_default = st.session_state.get("collect_selected", [])
+        default_selected = [key for key in session_default if key in options]
+        if not default_selected:
+            default_selected = options[:2]
+
+        def _format_source(name: str) -> str:
+            if source_types.get(name) == "collector":
+                return f"{name} (collector)"
+            return name
+
         selected = st.sidebar.multiselect(
-            "取得対象フィード",
+            "取得対象ソース",
             options=options,
             default=default_selected,
-            help="設定ファイルの feeds に登録されたキーから、取得対象を選びます。",
+            format_func=_format_source,
+            help="設定ファイルの feeds / collectors から収集対象を選びます。",
         )
         if ai_pick and st.sidebar.button("AIで選定"):
             suggested = ai_pick_feeds(cfg, name_map_path)
@@ -834,13 +1261,13 @@ def main() -> None:
                     render_notice(f"{feed_name}: 取得失敗 ({diag.get('message')})", "warning", target=st.sidebar)
                 elif status == "empty":
                     render_notice(f"{feed_name}: シグナル候補なし", "info", target=st.sidebar)
-        if selected and st.sidebar.button("この条件で取得", width="stretch"):
-            with st.spinner("最新のRSSを取得中..."):
-                feed_subset = tuple((key, feeds[key]) for key in selected if key in feeds)
-                items = cached_collect(feed_subset)
+        if selected and st.sidebar.button("この条件で取得", use_container_width=True):
+            with st.spinner("最新データを取得中..."):
+                items = collect_selected(cfg, selected)
+                st.session_state["collect_selected"] = selected
                 st.session_state["collected_items"] = items
         items = st.session_state.get("collected_items", [])
-        st.sidebar.caption("同じ条件での再取得はキャッシュが利用されます")
+        st.sidebar.caption("同じ条件での再取得はセッションキャッシュを利用します")
 
     if data_mode != "collect" and "collected_items" in st.session_state:
         st.session_state.pop("collected_items")
@@ -867,6 +1294,8 @@ def main() -> None:
         help="ランキング上位から何件表示するかを指定します。",
     )
 
+    render_hero(cfg, items, data_mode, min_score, top_k)
+
     quick_tab, signal_tab, config_tab = st.tabs(["ワンタッチ分析", "シグナル閲覧", "設定編集"])
 
     with quick_tab:
@@ -881,7 +1310,6 @@ def main() -> None:
         run_auto = auto_cols[3].button("ワンクリックで実行", type="primary")
 
         if run_auto:
-            feeds_cfg = cfg.get("feeds", {})
             if ai_feed_select:
                 picked_keys = ai_pick_feeds(cfg, name_map_path)
                 if not picked_keys:
@@ -892,9 +1320,8 @@ def main() -> None:
                 render_notice("設定内に利用可能なフィードがありません。設定編集で feeds を追加してください。", "warning")
             else:
                 _mark_feeds_selected(picked_keys)
-                feed_subset = tuple((k, feeds_cfg[k]) for k in picked_keys if k in feeds_cfg)
-                with st.spinner(f"RSS取得中…（{', '.join(picked_keys)}）"):
-                    items_auto = cached_collect(feed_subset)
+                with st.spinner(f"データ取得中…（{', '.join(picked_keys)}）"):
+                    items_auto = collect_selected(cfg, picked_keys)
                 items_auto = filter_recent(items_auto, hours=int(recent_hours))
                 weights_in = cfg.get("weights", {})
                 if auto_weighting and items_auto:
@@ -907,7 +1334,9 @@ def main() -> None:
                                 rows.append({"タグ": tag, "件数": cnt, "旧": old, "新": newv})
                         if rows:
                             st.dataframe(
-                                pd.DataFrame(rows).sort_values(["新", "旧"], ascending=False), width="stretch", hide_index=True
+                                pd.DataFrame(rows).sort_values(["新", "旧"], ascending=False),
+                                use_container_width=True,
+                                hide_index=True,
                             )
                         else:
                             st.caption("今回のニュースでは調整対象がありませんでした。")
@@ -945,7 +1374,7 @@ def main() -> None:
                                     "メモ": diag.get("message"),
                                 }
                             )
-                        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
                 if not show_auto:
                     render_notice("表示条件に一致するシグナルがありませんでした。", "info")
                 else:
@@ -1036,10 +1465,10 @@ def main() -> None:
                     )
                     with st.expander("タグ出現頻度", expanded=False):
                         st.bar_chart(top_tags.set_index("タグ"))
-                        st.dataframe(top_tags, width="stretch", hide_index=True)
+                        st.dataframe(top_tags, use_container_width=True, hide_index=True)
 
             with st.expander("詳細テーブル", expanded=False):
-                st.dataframe(df_table, width="stretch", hide_index=True)
+                st.dataframe(df_table, use_container_width=True, hide_index=True)
 
             if filtered:
                 csv_bytes = df_table.to_csv(index=False).encode("utf-8")

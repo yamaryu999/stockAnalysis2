@@ -57,3 +57,11 @@ class ScoredItem:
     reasons: List[str]
     hold: str  # "day" or "swing"
     tags: List[str]
+
+    def __getattr__(self, name: str):
+        """Provide backward-compatible access for legacy pickles missing `tags`."""
+        if name == "tags":
+            empty: List[str] = []
+            object.__setattr__(self, "tags", empty)
+            return empty
+        raise AttributeError(name)
